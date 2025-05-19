@@ -166,7 +166,7 @@ void attention(const double *Q, const double *K, const double *V, double *result
 
                 _mm256_storeu_pd(result + i * dv + j, sumv);
             } else {
-                for (int jj = j; jj < dv; jj ++) {
+                for (int jj = j; jj < dv; jj++) {
                     double sum = 0.0;
                     for (int k = 0; k < n; k++) {
                         sum += Q_Kt[i * n + k] * V[k * dv + jj];

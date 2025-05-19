@@ -149,7 +149,7 @@ struct attention_arg {
 };
 
 void *attention_worker(void *arg) {
-    const struct attention_arg *args = (struct attention_arg*)arg;
+    const struct attention_arg *args = (struct attention_arg *) arg;
 
     const double dk_sqrt = sqrt(args->dk);
 
@@ -177,7 +177,7 @@ void *attention_worker(void *arg) {
 
                 _mm256_storeu_pd(args->result + i * args->dv + j, sumv);
             } else {
-                for (int jj = j; jj < args->dv; jj ++) {
+                for (int jj = j; jj < args->dv; jj++) {
                     double sum = 0.0;
                     for (int k = 0; k < args->n; k++) {
                         sum += args->Q_Kt[i * args->n + k] * args->V[k * args->dv + jj];
@@ -197,7 +197,7 @@ void attention(const double *Q, const double *K, const double *V, double *result
     double *Q_Kt = calloc(m * n, sizeof(double));
     const int size = sysconf(_SC_NPROCESSORS_ONLN);
     pthread_t *threads = calloc(size - 1, sizeof(pthread_t));
-    struct attention_arg* args = calloc(size - 1, sizeof(struct attention_arg));
+    struct attention_arg *args = calloc(size - 1, sizeof(struct attention_arg));
 
     const int wrow = m / size, rrem = m % size;
     int rs = 0;
@@ -247,6 +247,7 @@ void attention(const double *Q, const double *K, const double *V, double *result
         pthread_join(threads[i], NULL);
     }
     free(threads);
+    free(args);
     free(Q_Kt);
 }
 
