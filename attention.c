@@ -42,14 +42,16 @@ static double reduce_max(__m256d v) {
 
 static double vmax_avx2(const double *z, const int n) {
     const int steps = n / 4;
+    double rmax = -HUGE_VAL;
 
-    __m256d maxv = _mm256_loadu_pd(z);
-
-    for (int i = 1; i < steps; i++) {
-        maxv = _mm256_max_pd(maxv, _mm256_loadu_pd(z + i * 4));
+    if (steps) {
+        __m256d maxv = _mm256_loadu_pd(z);
+        for (int i = 1; i < steps; i++) {
+            maxv = _mm256_max_pd(maxv, _mm256_loadu_pd(z + i * 4));
+        }
+        rmax = reduce_max(maxv);
     }
 
-    double rmax = reduce_max(maxv);
     for (int i = steps * 4; i < n; i++) {
         rmax = MAX(rmax, z[i]);
     }
@@ -59,19 +61,21 @@ static double vmax_avx2(const double *z, const int n) {
 
 static double vsum_avx2(const double *z, const int n) {
     const int steps = n / 4;
+    double total = 0.0;
 
-    __m256d sum = _mm256_loadu_pd(z);
-
-    for (int i = 1; i < steps; i++) {
-        sum = _mm256_add_pd(sum, _mm256_loadu_pd(z + i * 4));
+    if (steps) {
+        __m256d sum = _mm256_loadu_pd(z);
+        for (int i = 1; i < steps; i++) {
+            sum = _mm256_add_pd(sum, _mm256_loadu_pd(z + i * 4));
+        }
+        total += reduce_sum(sum);
     }
 
-    double remain = 0;
     for (int i = steps * 4; i < n; i++) {
-        remain += z[i];
+        total += z[i];
     }
 
-    return reduce_sum(sum) + remain;
+    return total;
 }
 
 static void vsub_avx2(double *out, const double *z, const double rhs, const int n) {
@@ -122,7 +126,7 @@ double dot_product_avx2(const double *a, const double *b, const int n) {
     for (int i = 0; i < steps; i++) {
         const __m256d x = _mm256_loadu_pd(a + i * 4);
         const __m256d y = _mm256_loadu_pd(b + i * 4);
-        sum = _mm256_add_pd(sum, _mm256_mul_pd(x, y));
+        sum = _mm256_fmadd_pd(x, y, sum);
     }
 
     for (int i = steps * 4; i < n; i++) {
@@ -135,8 +139,6 @@ double dot_product_avx2(const double *a, const double *b, const int n) {
 
 void attention(const double *Q, const double *K, const double *V, double *result,
                const int m, const int n, const int dk, const int dv) {
-    // TODO: your serial attention implementation
-
     double *Q_Kt = calloc(m * n, sizeof(double));
     const double dk_sqrt = sqrt(dk);
 
@@ -153,22 +155,25 @@ void attention(const double *Q, const double *K, const double *V, double *result
     }
 
     for (int i = 0; i < m; i++) {
-        for (int j = 0; j < dv; j++) {
+        for (int j = 0; j < dv; j += 4) {
             __m256d sumv = _mm256_setzero_pd();
-            const int steps = n / 4;
-            for (int k = 0; k < steps; k++) {
-                const int k2 = k * 4;
-                const __m256d x = _mm256_set_pd(Q_Kt[i * n + k2], Q_Kt[i * n + k2 + 1], Q_Kt[i * n + k2 + 2],
-                                                Q_Kt[i * n + k2 + 3]);
-                const __m256d y = _mm256_set_pd(V[k2 * dv + j], V[(k2 + 1) * dv + j], V[(k2 + 2) * dv + j],
-                                                V[(k2 + 3) * dv + j]);
-                sumv = _mm256_add_pd(sumv, _mm256_mul_pd(x, y));
+            if (j + 3 < dv) {
+                for (int k = 0; k < n; k++) {
+                    __m256d q_kt_bcast = _mm256_set1_pd(Q_Kt[i * n + k]);
+                    __m256d v_row = _mm256_loadu_pd(V + k * dv + j);
+                    sumv = _mm256_fmadd_pd(q_kt_bcast, v_row, sumv);
+                }
+
+                _mm256_storeu_pd(result + i * dv + j, sumv);
+            } else {
+                for (int jj = j; jj < dv; jj ++) {
+                    double sum = 0.0;
+                    for (int k = 0; k < n; k++) {
+                        sum += Q_Kt[i * n + k] * V[k * dv + jj];
+                    }
+                    result[i * dv + jj] = sum;
+                }
             }
-            double sum = reduce_sum(sumv);
-            for (int k = steps * 4; k < n; k++) {
-                sum += Q_Kt[i * n + k] * V[k * dv + j];
-            }
-            result[i * dv + j] = sum;
         }
     }
 
