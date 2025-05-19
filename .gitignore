@@ -5,6 +5,9 @@ cmake-build-*
 create_testcase.py
 .idea/
 __pycache__
+build/
+perf.data*
+callgrind.out.*
 
 # Prerequisites
 *.d
