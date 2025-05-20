@@ -4,7 +4,10 @@
 #include <immintrin.h>
 #include <math.h>
 #include <pthread.h>
+#include <smmintrin.h>
+#include <stdalign.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +59,7 @@ double vmax_avx2(const double *z, const int n) {
         rmax = reduce_max(maxv);
     }
 
+    alignas(32) double t[4];
     for (int i = steps * 4; i < n; i++) {
         rmax = MAX(rmax, z[i]);
     }
@@ -112,15 +116,81 @@ void vdiv_avx2(double *out, const double *z, const double base, const int n) {
     }
 }
 
+#define EXP_P0 1.0
+#define EXP_P1 1.0
+#define EXP_P2 0.5
+#define EXP_P3 0.16666666666666666
+#define EXP_P4 0.041666666666666664
+#define EXP_P5 0.008333333333333333
+#define EXP_P6 0.001388888888888889
+
+#define LOG2_E 1.4426950408889634073599
+#define LN2_HI 0.69314718036912381649
+#define LN2_LO 1.90821492927058770002e-10
+
+static inline __m256d exp256_pd(__m256d x) {
+    // Constants
+    const __m256d inv_ln2 = _mm256_set1_pd(LOG2_E);  // 1/ln(2)
+
+    // Split ln2 into high/low parts for extra precision: ln2 = ln2_hi + ln2_lo
+    const __m256d ln2_hi = _mm256_set1_pd(LN2_HI);
+    const __m256d ln2_lo = _mm256_set1_pd(LN2_LO);
+
+    // Polynomial coefficients for exp(r) on r in [-ln2/2, ln2/2]
+    const __m256d exp_p0 = _mm256_set1_pd(EXP_P0);
+    const __m256d exp_p1 = _mm256_set1_pd(EXP_P1);
+    const __m256d exp_p2 = _mm256_set1_pd(EXP_P2);
+    const __m256d exp_p3 = _mm256_set1_pd(EXP_P3);
+    const __m256d exp_p4 = _mm256_set1_pd(EXP_P4);
+    const __m256d exp_p5 = _mm256_set1_pd(EXP_P5);
+    const __m256d exp_p6 = _mm256_set1_pd(EXP_P6);
+
+    // 1. Range reduction: n = floor(x / ln2)
+    __m256d t = _mm256_mul_pd(x, inv_ln2);
+    __m256d n_real = _mm256_floor_pd(t);
+
+    // 2. r = x - n*ln2_hi - n*ln2_lo
+    __m256d r = _mm256_fnmadd_pd(n_real, ln2_hi, x);
+    r = _mm256_fnmadd_pd(n_real, ln2_lo, r);
+
+    // 3. Taylor series of exp(r) to the 7th term (0 - 6)
+    __m256d poly = exp_p6;
+    poly = _mm256_fmadd_pd(poly, r, exp_p5);
+    poly = _mm256_fmadd_pd(poly, r, exp_p4);
+    poly = _mm256_fmadd_pd(poly, r, exp_p3);
+    poly = _mm256_fmadd_pd(poly, r, exp_p2);
+    poly = _mm256_fmadd_pd(poly, r, exp_p1);
+    poly = _mm256_fmadd_pd(poly, r, exp_p0);
+
+    // 4. Reconstruct: result = p * 2^n
+    //    Build exponent bits: e = (n + bias) << 52
+    //    where bias = 1023 for IEEE‑754 double
+    const __m128i bias32 = _mm_set1_epi32(1023);
+    __m128i n_lo = _mm256_cvttpd_epi32(n_real);  // round->i32 low 4 lanes
+    __m256i n64 = _mm256_cvtepi32_epi64(n_lo);   // widen to i64
+    __m256i e64 = _mm256_add_epi64(n64, _mm256_cvtepi32_epi64(bias32));
+    e64 = _mm256_slli_epi64(e64, 52);  // shift into exponent field
+
+    __m256d pow2_n = _mm256_castsi256_pd(e64);
+
+    return _mm256_mul_pd(poly, pow2_n);
+}
+
 void softmax_avx2(double *z, double *exp_z, const int len) {
+    const int steps = len / 4;
     const double max = vmax_avx2(z, len);
-    vsub_avx2(exp_z, z, max, len);
-    for (int is = 0; is < len; is += SLICE) {
-        const int isize = (is + SLICE < len) ? SLICE : len - is;
-        for (int i = is; i < is + isize; i++) {
-            exp_z[i] = exp(exp_z[i]);
-        }
+    const __m256d maxv = _mm256_set1_pd(max);
+
+    for (int i = 0; i < steps; ++i) {
+        __m256d x = _mm256_loadu_pd(z + i * 4);
+        __m256d y = _mm256_sub_pd(x, maxv);
+        __m256d exp_y = exp256_pd(y);
+        _mm256_storeu_pd(exp_z + i * 4, exp_y);
     }
+    for (int i = steps * 4; i < len; ++i) {
+        exp_z[i] = exp(z[i] - max);
+    }
+
     const double sum = vsum_avx2(exp_z, len);
     vdiv_avx2(z, exp_z, sum, len);
 }
