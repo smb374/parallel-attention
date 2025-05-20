@@ -27,6 +27,27 @@
  * V: n by dv
  * result: m by dv, containing the attention result
  */
+
+static inline __attribute__((always_inline)) __m256i create_mask(const int rem) {
+    const __m256i indices = _mm256_set_epi64x(3, 2, 1, 0);
+    const __m256i remv = _mm256_set1_epi64x(MIN(rem, 4));
+    return _mm256_cmpgt_epi64(remv, indices);
+}
+
+static inline __attribute__((always_inline)) __m256d hmax(__m256d x) {
+    __m256d y = _mm256_permute2f128_pd(x, x, 1);
+    __m256d m1 = _mm256_max_pd(x, y);
+    __m256d m2 = _mm256_permute_pd(m1, 5);
+    return _mm256_max_pd(m1, m2);
+}
+
+static inline __attribute__((always_inline)) __m256d hsum(__m256d x) {
+    __m256d y = _mm256_permute2f128_pd(x, x, 1);
+    __m256d m1 = _mm256_add_pd(x, y);
+    __m256d m2 = _mm256_permute_pd(m1, 5);
+    return _mm256_add_pd(m1, m2);
+}
+
 double reduce_sum(__m256d v) {
     __m128d vlow = _mm256_castpd256_pd128(v);
     const __m128d vhigh = _mm256_extractf128_pd(v, 1);
@@ -45,72 +66,52 @@ double reduce_max(__m256d v) {
     return _mm_cvtsd_f64(_mm_max_sd(vlow, h64));
 }
 
-double vmax_avx2(const double *z, const int n) {
+static inline __m256d vmax_avx2(const double *z, const int n) {
     const int steps = n / 4;
-    double rmax = -HUGE_VAL;
+    __m256d maxv = _mm256_set1_pd(-HUGE_VAL);
 
-    if (steps) {
-        __m256d maxv = _mm256_loadu_pd(z);
-        for (int i = 1; i < steps; i++) {
-            maxv = _mm256_max_pd(maxv, _mm256_loadu_pd(z + i * 4));
-        }
-        rmax = reduce_max(maxv);
+    for (int i = 0; i < steps + 1; i++) {
+        __m256i mask = create_mask(n - i * 4);
+        __m256d x = _mm256_maskload_pd(z + i * 4, mask);
+        maxv = _mm256_max_pd(maxv, x);
     }
 
-    alignas(32) double t[4];
-    for (int i = steps * 4; i < n; i++) {
-        rmax = MAX(rmax, z[i]);
-    }
-
-    return rmax;
+    return hmax(maxv);
 }
 
-double vsum_avx2(const double *z, const int n) {
+static inline __m256d vsum_avx2(const double *z, const int n) {
     const int steps = n / 4;
-    double total = 0.0;
+    __m256d sum = _mm256_setzero_pd();
 
-    if (steps) {
-        __m256d sum = _mm256_loadu_pd(z);
-        for (int i = 1; i < steps; i++) {
-            sum = _mm256_add_pd(sum, _mm256_loadu_pd(z + i * 4));
-        }
-        total += reduce_sum(sum);
+    for (int i = 0; i < steps + 1; i++) {
+        __m256i mask = create_mask(n - i * 4);
+        __m256d x = _mm256_maskload_pd(z + i * 4, mask);
+        sum = _mm256_add_pd(sum, x);
     }
 
-    for (int i = steps * 4; i < n; i++) {
-        total += z[i];
-    }
-
-    return total;
+    return hsum(sum);
 }
 
 void vsub_avx2(double *out, const double *z, const double rhs, const int n) {
     const int steps = n / 4;
 
     const __m256d rhv = _mm256_set1_pd(rhs);
-    for (int i = 0; i < steps; i++) {
-        const __m256d x = _mm256_loadu_pd(z + i * 4);
-        const __m256d y = _mm256_sub_pd(x, rhv);
-        _mm256_storeu_pd(out + i * 4, y);
-    }
-
-    for (int i = steps * 4; i < n; i++) {
-        out[i] = z[i] - rhs;
+    for (int i = 0; i < steps + 1; i++) {
+        __m256i mask = create_mask(n - i * 4);
+        __m256d x = _mm256_maskload_pd(z + i * 4, mask);
+        __m256d y = _mm256_sub_pd(x, rhv);
+        _mm256_maskstore_pd(out + i * 4, mask, y);
     }
 }
 
-void vdiv_avx2(double *out, const double *z, const double base, const int n) {
+void vdiv_avx2(double *out, const double *z, const __m256d basev, const int n) {
     const int steps = n / 4;
 
-    const __m256d basev = _mm256_set1_pd(base);
-    for (int i = 0; i < steps; i++) {
-        const __m256d x = _mm256_loadu_pd(z + i * 4);
-        const __m256d y = _mm256_div_pd(x, basev);
-        _mm256_storeu_pd(out + i * 4, y);
-    }
-
-    for (int i = steps * 4; i < n; i++) {
-        out[i] = z[i] / base;
+    for (int i = 0; i < steps + 1; i++) {
+        __m256i mask = create_mask(n - i * 4);
+        __m256d x = _mm256_maskload_pd(z + i * 4, mask);
+        __m256d y = _mm256_div_pd(x, basev);
+        _mm256_maskstore_pd(out + i * 4, mask, y);
     }
 }
 
@@ -174,45 +175,34 @@ static inline __m256d exp256_pd(__m256d x) {
     return _mm256_mul_pd(poly, pow2_n);
 }
 
-void softmax_avx2(double *z, double *exp_z, const int len) {
-    const int steps = len / 4;
-    const double max = vmax_avx2(z, len);
-    const __m256d maxv = _mm256_set1_pd(max);
+void softmax_avx2(double *z, double *exp_z, const int n) {
+    const int steps = n / 4;
+    __m256d maxv = vmax_avx2(z, n);
 
-    for (int i = 0; i < steps; ++i) {
-        __m256d x = _mm256_loadu_pd(z + i * 4);
-        __m256d y = _mm256_sub_pd(x, maxv);
-        __m256d exp_y = exp256_pd(y);
-        _mm256_storeu_pd(exp_z + i * 4, exp_y);
-    }
-    for (int i = steps * 4; i < len; ++i) {
-        exp_z[i] = exp(z[i] - max);
+    for (int i = 0; i < steps + 1; ++i) {
+        __m256i mask = create_mask(n - i * 4);
+        __m256d x = _mm256_maskload_pd(z + i * 4, mask);
+        __m256d exp_y = exp256_pd(_mm256_sub_pd(x, maxv));
+        _mm256_maskstore_pd(exp_z + i * 4, mask, exp_y);
     }
 
-    const double sum = vsum_avx2(exp_z, len);
-    vdiv_avx2(z, exp_z, sum, len);
+    __m256d sum = vsum_avx2(exp_z, n);
+    vdiv_avx2(z, exp_z, sum, n);
 }
 
 double dot_product_avx2(const double *a, const double *b, const int n) {
     const int steps = n / 4;
     double total = 0;
+    __m256d sum = _mm256_setzero_pd();
 
-    if (steps) {
-        __m256d sum = _mm256_setzero_pd();
-
-        for (int i = 0; i < steps; i++) {
-            const __m256d x = _mm256_loadu_pd(a + i * 4);
-            const __m256d y = _mm256_loadu_pd(b + i * 4);
-            sum = _mm256_fmadd_pd(x, y, sum);
-        }
-        total = reduce_sum(sum);
+    for (int i = 0; i < steps + 1; i++) {
+        __m256i mask = create_mask(n - i * 4);
+        __m256d x = _mm256_maskload_pd(a + i * 4, mask);
+        __m256d y = _mm256_maskload_pd(b + i * 4, mask);
+        sum = _mm256_fmadd_pd(x, y, sum);
     }
 
-    for (int i = steps * 4; i < n; i++) {
-        total += a[i] * b[i];
-    }
-
-    return total;
+    return reduce_sum(sum);
 }
 
 void attention(const double *Q, const double *K, const double *V, double *result, const int m, const int n,
@@ -222,45 +212,20 @@ void attention(const double *Q, const double *K, const double *V, double *result
     double *exp_z = buf + m * n;
     const double dk_sqrt = sqrt(dk);
 
-    for (int is = 0; is < m; is += SLICE) {
-        const int isize = (is + SLICE < m) ? SLICE : m - is;
-        for (int js = 0; js < n; js += SLICE) {
-            const int jsize = (js + SLICE < n) ? SLICE : n - js;
-            for (int i = is; i < is + isize; i++) {
-                for (int j = js; j < js + jsize; j++) {
-                    Q_Kt[i * n + j] = dot_product_avx2(Q + i * dk, K + j * dk, dk) / dk_sqrt;
-                }
-            }
-        }
-    }
-
-    for (int is = 0; is < m; is += SLICE) {
-        const int isize = (is + SLICE < m) ? SLICE : m - is;
-        for (int i = is; i < is + isize; i++) {
-            softmax_avx2(Q_Kt + i * n, exp_z, n);
-        }
-    }
-
     for (int i = 0; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            Q_Kt[i * n + j] = dot_product_avx2(Q + i * dk, K + j * dk, dk) / dk_sqrt;
+        }
+        softmax_avx2(Q_Kt + i * n, exp_z, n);
         for (int j = 0; j < dv; j += 4) {
             __m256d sumv = _mm256_setzero_pd();
-            if (j + 3 < dv) {
-                for (int k = 0; k < n; k++) {
-                    __m256d q_kt_bcast = _mm256_set1_pd(Q_Kt[i * n + k]);
-                    __m256d v_row = _mm256_loadu_pd(V + k * dv + j);
-                    sumv = _mm256_fmadd_pd(q_kt_bcast, v_row, sumv);
-                }
-
-                _mm256_storeu_pd(result + i * dv + j, sumv);
-            } else {
-                for (int jj = j; jj < dv; jj++) {
-                    double sum = 0.0;
-                    for (int k = 0; k < n; k++) {
-                        sum += Q_Kt[i * n + k] * V[k * dv + jj];
-                    }
-                    result[i * dv + jj] = sum;
-                }
+            __m256i mask = create_mask(dv - j);
+            for (int k = 0; k < n; k++) {
+                __m256d q_kt_bcast = _mm256_set1_pd(Q_Kt[i * n + k]);
+                __m256d v_row = _mm256_maskload_pd(V + k * dv + j, mask);
+                sumv = _mm256_fmadd_pd(q_kt_bcast, v_row, sumv);
             }
+            _mm256_maskstore_pd(result + i * dv + j, mask, sumv);
         }
     }
 
