@@ -1,21 +1,22 @@
 //
 // Created by poyehchen on 5/19/25.
 //
+#include <immintrin.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>
-#include <immintrin.h>
-#include <sys/param.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <string.h>
+#include <sys/param.h>
+#include <time.h>
+#include <unistd.h>
 
 // NOTE: feel free to include any header you need, but we will not
 // link libraries other than C's math library for you.
 
 // NOTE: feel free to add new macros
+#define SLICE 8
 
 // NOTE: feel free to add new functions
 
@@ -25,7 +26,7 @@
  * V: n by dv
  * result: m by dv, containing the attention result
  */
-static double reduce_sum(__m256d v) {
+double reduce_sum(__m256d v) {
     __m128d vlow = _mm256_castpd256_pd128(v);
     const __m128d vhigh = _mm256_extractf128_pd(v, 1);
     vlow = _mm_add_pd(vlow, vhigh);
@@ -34,7 +35,7 @@ static double reduce_sum(__m256d v) {
     return _mm_cvtsd_f64(_mm_add_sd(vlow, h64));
 }
 
-static double reduce_max(__m256d v) {
+double reduce_max(__m256d v) {
     __m128d vlow = _mm256_castpd256_pd128(v);
     const __m128d vhigh = _mm256_extractf128_pd(v, 1);
     vlow = _mm_max_pd(vlow, vhigh);
@@ -43,7 +44,7 @@ static double reduce_max(__m256d v) {
     return _mm_cvtsd_f64(_mm_max_sd(vlow, h64));
 }
 
-static double vmax_avx2(const double *z, const int n) {
+double vmax_avx2(const double *z, const int n) {
     const int steps = n / 4;
     double rmax = -HUGE_VAL;
 
@@ -62,7 +63,7 @@ static double vmax_avx2(const double *z, const int n) {
     return rmax;
 }
 
-static double vsum_avx2(const double *z, const int n) {
+double vsum_avx2(const double *z, const int n) {
     const int steps = n / 4;
     double total = 0.0;
 
@@ -81,7 +82,7 @@ static double vsum_avx2(const double *z, const int n) {
     return total;
 }
 
-static void vsub_avx2(double *out, const double *z, const double rhs, const int n) {
+void vsub_avx2(double *out, const double *z, const double rhs, const int n) {
     const int steps = n / 4;
 
     const __m256d rhv = _mm256_set1_pd(rhs);
@@ -96,7 +97,7 @@ static void vsub_avx2(double *out, const double *z, const double rhs, const int 
     }
 }
 
-static void vdiv_avx2(double *out, const double *z, const double base, const int n) {
+void vdiv_avx2(double *out, const double *z, const double base, const int n) {
     const int steps = n / 4;
 
     const __m256d basev = _mm256_set1_pd(base);
@@ -114,30 +115,36 @@ static void vdiv_avx2(double *out, const double *z, const double base, const int
 void softmax_avx2(double *z, double *exp_z, const int len) {
     const double max = vmax_avx2(z, len);
     vsub_avx2(exp_z, z, max, len);
-    for (int i = 0; i < len; i++) {
-        exp_z[i] = exp(exp_z[i]);
+    for (int is = 0; is < len; is += SLICE) {
+        const int isize = (is + SLICE < len) ? SLICE : len - is;
+        for (int i = is; i < is + isize; i++) {
+            exp_z[i] = exp(exp_z[i]);
+        }
     }
     const double sum = vsum_avx2(exp_z, len);
     vdiv_avx2(z, exp_z, sum, len);
 }
 
 double dot_product_avx2(const double *a, const double *b, const int n) {
-    double remain = 0.0;
     const int steps = n / 4;
-    __m256d sum = _mm256_setzero_pd();
+    double total = 0;
 
-    for (int i = 0; i < steps; i++) {
-        const __m256d x = _mm256_loadu_pd(a + i * 4);
-        const __m256d y = _mm256_loadu_pd(b + i * 4);
-        sum = _mm256_fmadd_pd(x, y, sum);
+    if (steps) {
+        __m256d sum = _mm256_setzero_pd();
+
+        for (int i = 0; i < steps; i++) {
+            const __m256d x = _mm256_loadu_pd(a + i * 4);
+            const __m256d y = _mm256_loadu_pd(b + i * 4);
+            sum = _mm256_fmadd_pd(x, y, sum);
+        }
+        total = reduce_sum(sum);
     }
 
     for (int i = steps * 4; i < n; i++) {
-        remain += a[i] * b[i];
+        total += a[i] * b[i];
     }
 
-
-    return reduce_sum(sum) + remain;
+    return total;
 }
 
 struct attention_arg {
@@ -149,23 +156,34 @@ struct attention_arg {
 };
 
 void *attention_worker(void *arg) {
-    const struct attention_arg *args = (struct attention_arg *) arg;
+    const struct attention_arg *args = (struct attention_arg *)arg;
 
     const double dk_sqrt = sqrt(args->dk);
+    const int rs = args->ms, re = args->ms + args->msize;
 
-    for (int i = args->ms; i < args->ms + args->msize; i++) {
-        for (int j = 0; j < args->n; j++) {
-            args->Q_Kt[i * args->n + j] = dot_product_avx2(args->Q + i * args->dk, args->K + j * args->dk, args->dk) / dk_sqrt;
+    for (int is = rs; is < re; is += SLICE) {
+        const int isize = (is + SLICE < re) ? SLICE : re - is;
+        for (int js = 0; js < args->n; js += SLICE) {
+            const int jsize = (js + SLICE < args->n) ? SLICE : args->n - js;
+            for (int i = is; i < is + isize; i++) {
+                for (int j = js; j < js + jsize; j++) {
+                    args->Q_Kt[i * args->n + j] =
+                        dot_product_avx2(args->Q + i * args->dk, args->K + j * args->dk, args->dk) / dk_sqrt;
+                }
+            }
         }
     }
 
     double *buffer = calloc(args->n, sizeof(double));
 
-    for (int i = args->ms; i < args->ms + args->msize; i++) {
-        softmax_avx2(args->Q_Kt + i * args->n, buffer, args->n);
+    for (int is = rs; is < re; is += SLICE) {
+        const int isize = (is + SLICE < re) ? SLICE : re - is;
+        for (int i = is; i < is + isize; i++) {
+            softmax_avx2(args->Q_Kt + i * args->n, buffer, args->n);
+        }
     }
 
-    for (int i = args->ms; i < args->ms + args->msize; i++) {
+    for (int i = rs; i < re; i++) {
         for (int j = 0; j < args->dv; j += 4) {
             __m256d sumv = _mm256_setzero_pd();
             if (j + 3 < args->dv) {
@@ -192,10 +210,10 @@ void *attention_worker(void *arg) {
     return NULL;
 }
 
-void attention(const double *Q, const double *K, const double *V, double *result,
-               const int m, const int n, const int dk, const int dv) {
+void attention(const double *Q, const double *K, const double *V, double *result, const int m, const int n,
+               const int dk, const int dv) {
     double *Q_Kt = calloc(m * n, sizeof(double));
-    const int size = sysconf(_SC_NPROCESSORS_ONLN);
+    const int size = (int)sysconf(_SC_NPROCESSORS_ONLN);
     pthread_t *threads = calloc(size - 1, sizeof(pthread_t));
     struct attention_arg *args = calloc(size - 1, sizeof(struct attention_arg));
 
@@ -242,7 +260,6 @@ void attention(const double *Q, const double *K, const double *V, double *result
 
     attention_worker(&arg);
 
-
     for (int i = 0; i < size - 1; i++) {
         pthread_join(threads[i], NULL);
     }
@@ -258,7 +275,7 @@ void attention(const double *Q, const double *K, const double *V, double *result
 // ----------------------------- You shall not pass! ----------------------------- //
 
 void read_matrix(double **M, size_t len, FILE *file) {
-    *M = (double *) malloc(len * sizeof(double));
+    *M = (double *)malloc(len * sizeof(double));
     if (fread(*M, sizeof(double), len, file) != len) {
         fprintf(stderr, "Invalid testing data.\n");
         exit(1);
@@ -273,18 +290,15 @@ void read_matrix(double **M, size_t len, FILE *file) {
  *   3. n*dk doubles -> K
  *   4. n*dv doubles -> V
  */
-void read_matrices(const char *file_path, double **Q, double **K, double **V,
-                   int *m, int *n, int *dk, int *dv) {
+void read_matrices(const char *file_path, double **Q, double **K, double **V, int *m, int *n, int *dk, int *dv) {
     FILE *file = fopen(file_path, "rb");
     if (!file) {
         fprintf(stderr, "Cannot open file: %s\n", file_path);
         exit(1);
     }
 
-    if (fread(m, sizeof(int), 1, file) != 1 ||
-        fread(n, sizeof(int), 1, file) != 1 ||
-        fread(dk, sizeof(int), 1, file) != 1 ||
-        fread(dv, sizeof(int), 1, file) != 1) {
+    if (fread(m, sizeof(int), 1, file) != 1 || fread(n, sizeof(int), 1, file) != 1 ||
+        fread(dk, sizeof(int), 1, file) != 1 || fread(dv, sizeof(int), 1, file) != 1) {
         fprintf(stderr, "Invalid testing data.\n");
         exit(1);
     }
@@ -304,10 +318,8 @@ bool verify(const char *file_path, const double *result) {
     }
 
     int m, n, dk, dv;
-    if (fread(&m, sizeof(int), 1, file) != 1 ||
-        fread(&n, sizeof(int), 1, file) != 1 ||
-        fread(&dk, sizeof(int), 1, file) != 1 ||
-        fread(&dv, sizeof(int), 1, file) != 1) {
+    if (fread(&m, sizeof(int), 1, file) != 1 || fread(&n, sizeof(int), 1, file) != 1 ||
+        fread(&dk, sizeof(int), 1, file) != 1 || fread(&dv, sizeof(int), 1, file) != 1) {
         fprintf(stderr, "Invalid testing data.\n");
         exit(1);
     }
@@ -317,7 +329,7 @@ bool verify(const char *file_path, const double *result) {
 
     bool res = true;
     double threshold = 0.02;
-    double *row = (double *) malloc(sizeof(double) * dv);
+    double *row = (double *)malloc(sizeof(double) * dv);
 
     for (int i = 0; i < m; i++) {
         int base = i * dv;

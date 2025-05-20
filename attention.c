@@ -15,6 +15,7 @@
 // link libraries other than C's math library for you.
 
 // NOTE: feel free to add new macros
+#define SLICE 8
 
 // NOTE: feel free to add new functions
 
@@ -113,29 +114,36 @@ void vdiv_avx2(double *out, const double *z, const double base, const int n) {
 void softmax_avx2(double *z, double *exp_z, const int len) {
     const double max = vmax_avx2(z, len);
     vsub_avx2(exp_z, z, max, len);
-    for (int i = 0; i < len; i++) {
-        exp_z[i] = exp(exp_z[i]);
+    for (int is = 0; is < len; is += SLICE) {
+        const int isize = (is + SLICE < len) ? SLICE : len - is;
+        for (int i = is; i < is + isize; i++) {
+            exp_z[i] = exp(exp_z[i]);
+        }
     }
     const double sum = vsum_avx2(exp_z, len);
     vdiv_avx2(z, exp_z, sum, len);
 }
 
 double dot_product_avx2(const double *a, const double *b, const int n) {
-    double remain = 0.0;
     const int steps = n / 4;
-    __m256d sum = _mm256_setzero_pd();
+    double total = 0;
 
-    for (int i = 0; i < steps; i++) {
-        const __m256d x = _mm256_loadu_pd(a + i * 4);
-        const __m256d y = _mm256_loadu_pd(b + i * 4);
-        sum = _mm256_fmadd_pd(x, y, sum);
+    if (steps) {
+        __m256d sum = _mm256_setzero_pd();
+
+        for (int i = 0; i < steps; i++) {
+            const __m256d x = _mm256_loadu_pd(a + i * 4);
+            const __m256d y = _mm256_loadu_pd(b + i * 4);
+            sum = _mm256_fmadd_pd(x, y, sum);
+        }
+        total = reduce_sum(sum);
     }
 
     for (int i = steps * 4; i < n; i++) {
-        remain += a[i] * b[i];
+        total += a[i] * b[i];
     }
 
-    return reduce_sum(sum) + remain;
+    return total;
 }
 
 void attention(const double *Q, const double *K, const double *V, double *result, const int m, const int n,
@@ -143,16 +151,24 @@ void attention(const double *Q, const double *K, const double *V, double *result
     double *Q_Kt = calloc(m * n, sizeof(double));
     const double dk_sqrt = sqrt(dk);
 
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            Q_Kt[i * n + j] = dot_product_avx2(Q + i * dk, K + j * dk, dk) / dk_sqrt;
+    for (int is = 0; is < m; is += SLICE) {
+        const int isize = (is + SLICE < m) ? SLICE : m - is;
+        for (int js = 0; js < n; js += SLICE) {
+            const int jsize = (js + SLICE < n) ? SLICE : n - js;
+            for (int i = is; i < is + isize; i++) {
+                for (int j = js; j < js + jsize; j++) {
+                    Q_Kt[i * n + j] = dot_product_avx2(Q + i * dk, K + j * dk, dk) / dk_sqrt;
+                }
+            }
         }
     }
-
     double *buffer = calloc(n, sizeof(double));
 
-    for (int i = 0; i < m; i++) {
-        softmax_avx2(Q_Kt + i * n, buffer, n);
+    for (int is = 0; is < m; is += SLICE) {
+        const int isize = (is + SLICE < m) ? SLICE : m - is;
+        for (int i = is; i < is + isize; i++) {
+            softmax_avx2(Q_Kt + i * n, buffer, n);
+        }
     }
 
     for (int i = 0; i < m; i++) {
