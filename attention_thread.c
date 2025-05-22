@@ -227,6 +227,17 @@ double dot_product_avx2(const double *a, const double *b, const int n) {
     return reduce_sum(sum);
 }
 
+double invsqrt(double number) {
+    double y = number;
+    double x2 = y * 0.5;
+    int64_t i;
+    memcpy(&i, &y, sizeof(int64_t));
+    i = 0x5fe6eb50c7b537a9 - (i >> 1);
+    memcpy(&y, &i, sizeof(int64_t));
+    y = y * (1.5 - (x2 * y * y));
+    return y;
+}
+
 struct attention_arg {
     const double *Q, *K, *V;
     double *result;
@@ -258,7 +269,7 @@ void *attention_worker(void *arg) {
     }
 
     const __m256i fmask = _mm256_set1_epi8(-1);
-    const __m256d inv_dk_sqrt = _mm256_set1_pd(1 / sqrt(args->dk));
+    const __m256d inv_dk_sqrt = _mm256_set1_pd(invsqrt(args->dk));
     for (int i = args->ms; i < args->ms + args->msize; i++) {
         vmul_avx2(Q_Kt + i * args->n, Q_Kt + i * args->n, inv_dk_sqrt, args->n);
         softmax_avx2(Q_Kt + i * args->n, exp_z, args->n);
@@ -281,7 +292,8 @@ void *attention_worker(void *arg) {
 
 void attention(const double *Q, const double *K, const double *V, double *result, const int m, const int n,
                const int dk, const int dv) {
-    const int size = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    // const int size = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    const int size = 8;
     pthread_t *threads = calloc(size - 1, sizeof(pthread_t));
     struct attention_arg *args = calloc(size - 1, sizeof(struct attention_arg));
 

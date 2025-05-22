@@ -225,6 +225,17 @@ double dot_product_avx2(const double *a, const double *b, const int n) {
     return reduce_sum(sum);
 }
 
+double invsqrt(double number) {
+    double y = number;
+    double x2 = y * 0.5;
+    int64_t i;
+    memcpy(&i, &y, sizeof(int64_t));
+    i = 0x5fe6eb50c7b537a9 - (i >> 1);
+    memcpy(&y, &i, sizeof(int64_t));
+    y = y * (1.5 - (x2 * y * y));
+    return y;
+}
+
 void attention(const double *Q, const double *K, const double *V, double *result, const int m, const int n,
                const int dk, const int dv) {
     double *buf = calloc(m * n + n, sizeof(double));
@@ -247,7 +258,7 @@ void attention(const double *Q, const double *K, const double *V, double *result
     }
 
     const __m256i fmask = _mm256_set1_epi8(-1);
-    const __m256d inv_dk_sqrt = _mm256_set1_pd(1 / sqrt(dk));
+    const __m256d inv_dk_sqrt = _mm256_set1_pd(invsqrt(dk));
     for (int i = 0; i < m; i++) {
         vmul_avx2(Q_Kt + i * n, Q_Kt + i * n, inv_dk_sqrt, n);
         softmax_avx2(Q_Kt + i * n, exp_z, n);
