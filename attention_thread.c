@@ -165,6 +165,8 @@ static inline __attribute__((always_inline)) void vadd_avx2(double *out, const d
 #define EXP_P4 0.041666666666666664
 #define EXP_P5 0.008333333333333333
 #define EXP_P6 0.001388888888888889
+#define EXP_P7 0.0001984126984126984
+#define EXP_P8 2.48015873015873e-05
 
 #define LOG2_E 1.4426950408889634073599
 #define LN2_HI 0.69314718036912381649
@@ -186,6 +188,8 @@ static inline __m256d exp256_pd(__m256d x) {
     const __m256d exp_p4 = _mm256_set1_pd(EXP_P4);
     const __m256d exp_p5 = _mm256_set1_pd(EXP_P5);
     const __m256d exp_p6 = _mm256_set1_pd(EXP_P6);
+    // const __m256d exp_p7 = _mm256_set1_pd(EXP_P7);
+    // const __m256d exp_p8 = _mm256_set1_pd(EXP_P8);
 
     // 1. Range reduction: n = floor(x / ln2)
     __m256d t = _mm256_mul_pd(x, inv_ln2);
@@ -215,7 +219,15 @@ static inline __m256d exp256_pd(__m256d x) {
 
     __m256d pow2_n = _mm256_castsi256_pd(e64);
 
-    return _mm256_mul_pd(poly, pow2_n);
+    __m256d res = _mm256_mul_pd(poly, pow2_n);
+
+    for (int i = 0; i < 4; i++) {
+        if (x[i] == -INFINITY) {
+            res[i] = 0;
+        }
+    }
+
+    return res;
 }
 
 void softmax_avx2(double *z, double *exp_z, const __m256d maxv, const int n) {
@@ -237,18 +249,100 @@ void softmax_avx2(double *z, double *exp_z, const __m256d maxv, const int n) {
     vdiv_avx2(z, exp_z, sum, n);
 }
 
-void matmulT_recon_kernel(double *out, const double *A, const double *B, const int n, const int p, const int ms,
-                          const int msize, const int ns, const int nsize, const int ps, const int psize) {
+void dot_product_avx2(double *out, const double *a, const double *b, const int n) {
+    const int nsteps = (n / 2) * 4, nrem = n % 4;
+    int i = 0;
+    for (; i < nsteps; i += 4) {
+        __m256d x = _mm256_loadu_pd(a + i);
+        __m256d y = _mm256_loadu_pd(b + i);
+        __m256d sum = _mm256_add_pd(x, y);
+        _mm256_storeu_pd(out + i, sum);
+    }
+    if (nrem) {
+        __m256i mask = create_mask(n - i);
+        __m256d x = _mm256_maskload_pd(a + i, mask);
+        __m256d y = _mm256_maskload_pd(b + i, mask);
+        __m256d sum = _mm256_add_pd(x, y);
+        _mm256_maskstore_pd(out + i, mask, sum);
+    }
+}
+
+void matmulT_kernel(double *out, const double *A, const double *B, const int out_n, const int p, const int ms,
+                    const int msize, const int ns, const int nsize, const int ps, const int psize) {
+    const int me = ms + msize, ne = ns + nsize, pe = ps + psize;
+    const int msteps = ms + (msize / 4) * 4, mrem = msize % 4;
     const int nsteps = ns + (nsize / 4) * 4, nrem = nsize % 4;
     const int psteps = ps + (psize / 4) * 4, prem = psize % 4;
-    const int me = ms + msize, ne = ns + nsize, pe = ps + psize;
-    for (int i = ms; i < me; i++) {
+    int i = ms;
+    for (; i < msteps; i += 2) {
         int j = ns;
-        for (; j < nsteps; j += 4) {
+        for (; j < nsteps; j += 2) {
+            __m256d sum00 = _mm256_setzero_pd();
+            __m256d sum01 = _mm256_setzero_pd();
+            __m256d sum10 = _mm256_setzero_pd();
+            __m256d sum11 = _mm256_setzero_pd();
+
+            int k = ps;
+            for (; k < psteps; k += 4) {
+                __m256d x0 = _mm256_loadu_pd(A + i * p + k);
+                __m256d x1 = _mm256_loadu_pd(A + (i + 1) * p + k);
+
+                __m256d y0 = _mm256_loadu_pd(B + j * p + k);
+                __m256d y1 = _mm256_loadu_pd(B + (j + 1) * p + k);
+
+                sum00 = _mm256_fmadd_pd(x0, y0, sum00);
+                sum01 = _mm256_fmadd_pd(x0, y1, sum01);
+                sum10 = _mm256_fmadd_pd(x1, y0, sum10);
+                sum11 = _mm256_fmadd_pd(x1, y1, sum11);
+            }
+            if (prem) {
+                const __m256i mask = create_mask(pe - k);
+                __m256d x0 = _mm256_maskload_pd(A + i * p + k, mask);
+                __m256d x1 = _mm256_maskload_pd(A + (i + 1) * p + k, mask);
+
+                __m256d y0 = _mm256_maskload_pd(B + j * p + k, mask);
+                __m256d y1 = _mm256_maskload_pd(B + (j + 1) * p + k, mask);
+
+                sum00 = _mm256_fmadd_pd(x0, y0, sum00);
+                sum01 = _mm256_fmadd_pd(x0, y1, sum01);
+                sum10 = _mm256_fmadd_pd(x1, y0, sum10);
+                sum11 = _mm256_fmadd_pd(x1, y1, sum11);
+            }
+            out[i * out_n + j] = reduce_sum(sum00);
+            out[i * out_n + j + 1] = reduce_sum(sum01);
+            out[(i + 1) * out_n + j] = reduce_sum(sum10);
+            out[(i + 1) * out_n + j + 1] = reduce_sum(sum11);
+        }
+        if (nrem) {
             __m256d sum0 = _mm256_setzero_pd();
             __m256d sum1 = _mm256_setzero_pd();
-            __m256d sum2 = _mm256_setzero_pd();
-            __m256d sum3 = _mm256_setzero_pd();
+            int k = ps;
+            for (; k < psteps; k += 4) {
+                __m256d x0 = _mm256_loadu_pd(A + i * p + k);
+                __m256d x1 = _mm256_loadu_pd(A + (i + 1) * p + k);
+
+                __m256d y = _mm256_loadu_pd(B + j * p + k);
+
+                sum0 = _mm256_fmadd_pd(x0, y, sum0);
+                sum1 = _mm256_fmadd_pd(x1, y, sum1);
+            }
+            if (prem) {
+                __m256i mask = create_mask(pe - k);
+                __m256d x0 = _mm256_maskload_pd(A + i * p + k, mask);
+                __m256d x1 = _mm256_maskload_pd(A + (i + 1) * p + k, mask);
+                __m256d y = _mm256_maskload_pd(B + j * p + k, mask);
+                sum0 = _mm256_fmadd_pd(x0, y, sum0);
+                sum1 = _mm256_fmadd_pd(x1, y, sum1);
+            }
+            out[i * out_n + j] = reduce_sum(sum0);
+            out[(i + 1) * out_n + j] = reduce_sum(sum1);
+        }
+    }
+    if (mrem) {
+        int j = ns;
+        for (; j < nsteps; j += 2) {
+            __m256d sum0 = _mm256_setzero_pd();
+            __m256d sum1 = _mm256_setzero_pd();
 
             int k = ps;
             for (; k < psteps; k += 4) {
@@ -256,13 +350,9 @@ void matmulT_recon_kernel(double *out, const double *A, const double *B, const i
 
                 __m256d y0 = _mm256_loadu_pd(B + j * p + k);
                 __m256d y1 = _mm256_loadu_pd(B + (j + 1) * p + k);
-                __m256d y2 = _mm256_loadu_pd(B + (j + 2) * p + k);
-                __m256d y3 = _mm256_loadu_pd(B + (j + 3) * p + k);
 
                 sum0 = _mm256_fmadd_pd(x, y0, sum0);
                 sum1 = _mm256_fmadd_pd(x, y1, sum1);
-                sum2 = _mm256_fmadd_pd(x, y2, sum2);
-                sum3 = _mm256_fmadd_pd(x, y3, sum3);
             }
             if (prem) {
                 const __m256i mask = create_mask(pe - k);
@@ -270,36 +360,30 @@ void matmulT_recon_kernel(double *out, const double *A, const double *B, const i
 
                 __m256d y0 = _mm256_maskload_pd(B + j * p + k, mask);
                 __m256d y1 = _mm256_maskload_pd(B + (j + 1) * p + k, mask);
-                __m256d y2 = _mm256_maskload_pd(B + (j + 2) * p + k, mask);
-                __m256d y3 = _mm256_maskload_pd(B + (j + 3) * p + k, mask);
 
                 sum0 = _mm256_fmadd_pd(x, y0, sum0);
                 sum1 = _mm256_fmadd_pd(x, y1, sum1);
-                sum2 = _mm256_fmadd_pd(x, y2, sum2);
-                sum3 = _mm256_fmadd_pd(x, y3, sum3);
             }
-            out[i * n + j] = reduce_sum(sum0);
-            out[i * n + j + 1] = reduce_sum(sum1);
-            out[i * n + j + 2] = reduce_sum(sum2);
-            out[i * n + j + 3] = reduce_sum(sum3);
+            out[i * out_n + j] = reduce_sum(sum0);
+            out[i * out_n + j + 1] = reduce_sum(sum1);
         }
         if (nrem) {
-            for (; j < ne; j++) {
-                __m256d sum = _mm256_setzero_pd();
-                int k = ps;
-                for (; k < psteps; k += 4) {
-                    __m256d x = _mm256_loadu_pd(A + i * p + k);
-                    __m256d y = _mm256_loadu_pd(B + j * p + k);
-                    sum = _mm256_fmadd_pd(x, y, sum);
-                }
-                if (prem) {
-                    __m256i mask = create_mask(pe - k);
-                    __m256d x = _mm256_maskload_pd(A + i * p + k, mask);
-                    __m256d y = _mm256_maskload_pd(B + j * p + k, mask);
-                    sum = _mm256_fmadd_pd(x, y, sum);
-                }
-                out[i * n + j] = reduce_sum(sum);
+            __m256d sum = _mm256_setzero_pd();
+            int k = ps;
+            for (; k < psteps; k += 4) {
+                __m256d x = _mm256_loadu_pd(A + i * p + k);
+
+                __m256d y = _mm256_loadu_pd(B + j * p + k);
+
+                sum = _mm256_fmadd_pd(x, y, sum);
             }
+            if (prem) {
+                __m256i mask = create_mask(pe - k);
+                __m256d x0 = _mm256_maskload_pd(A + i * p + k, mask);
+                __m256d y = _mm256_maskload_pd(B + j * p + k, mask);
+                sum = _mm256_fmadd_pd(x0, y, sum);
+            }
+            out[i * out_n + j] = reduce_sum(sum);
         }
     }
 }
@@ -400,77 +484,164 @@ double invsqrt(double number) {
     return y;
 }
 
+// Flash attention core with 4x4 tile
+static inline void flash_atten_4x4core(double *s_r, double *p_r, double *O_r, double *PK_r, __m256d *m_r, __m256d *l_r,
+                                       const double *Qb, const double *Kb, const double *Vb, const __m256d inv_dk_sqrt,
+                                       const int jsize, const int dv, const int dk) {
+    __m256d m_rl = *m_r;
+    __m256d l_rl = *l_r;
+    matmulT_kernel(s_r, Qb, Kb, 4, dk, 0, 4, 0, jsize, 0, dk);
+    vmul_avx2(s_r, s_r, inv_dk_sqrt, 16);
+    __m256d s_rv0 = _mm256_load_pd(s_r);
+    __m256d s_rv1 = _mm256_load_pd(s_r + 4);
+    __m256d s_rv2 = _mm256_load_pd(s_r + 8);
+    __m256d s_rv3 = _mm256_load_pd(s_r + 12);
+
+    __m256d s_rmax = _mm256_set_pd(reduce_max(s_rv3), reduce_max(s_rv2), reduce_max(s_rv1), reduce_max(s_rv0));
+    __m256d m_rn = _mm256_max_pd(m_rl, s_rmax);
+    __m256d m_rdiff = _mm256_sub_pd(m_rl, m_rn);
+
+    __m256d drate = exp256_pd(m_rdiff);
+    l_rl = _mm256_mul_pd(l_rl, drate);
+
+    vmul_avx2(O_r, O_r, _mm256_set1_pd(drate[0]), dv);
+    vmul_avx2(O_r + dv, O_r + dv, _mm256_set1_pd(drate[1]), dv);
+    vmul_avx2(O_r + 2 * dv, O_r + 2 * dv, _mm256_set1_pd(drate[2]), dv);
+    vmul_avx2(O_r + 3 * dv, O_r + 3 * dv, _mm256_set1_pd(drate[3]), dv);
+    // Softmax start
+    __m256d m_rnv0 = _mm256_set1_pd(m_rn[0]);
+    __m256d m_rnv1 = _mm256_set1_pd(m_rn[1]);
+    __m256d m_rnv2 = _mm256_set1_pd(m_rn[2]);
+    __m256d m_rnv3 = _mm256_set1_pd(m_rn[3]);
+    __m256d exp_y0 = exp256_pd(_mm256_sub_pd(s_rv0, m_rnv0));
+    __m256d exp_y1 = exp256_pd(_mm256_sub_pd(s_rv1, m_rnv1));
+    __m256d exp_y2 = exp256_pd(_mm256_sub_pd(s_rv2, m_rnv2));
+    __m256d exp_y3 = exp256_pd(_mm256_sub_pd(s_rv3, m_rnv3));
+    _mm256_store_pd(p_r, exp_y0);
+    _mm256_store_pd(p_r + 4, exp_y1);
+    _mm256_store_pd(p_r + 8, exp_y2);
+    _mm256_store_pd(p_r + 12, exp_y3);
+    // Softmax end
+    matmul_kernel(PK_r, p_r, Vb, 4, dv, 0, 4, 0, jsize, 0, dv);
+    vadd_avx2(O_r, O_r, PK_r, 4 * dv);
+    __m256d exp_sums = _mm256_set_pd(reduce_sum(exp_y3), reduce_sum(exp_y2), reduce_sum(exp_y1), reduce_sum(exp_y0));
+    l_rl = _mm256_add_pd(l_rl, exp_sums);
+    *l_r = l_rl;
+    *m_r = m_rn;
+}
+
+static inline void flash_atten_1x4core(double *s_r, double *p_r, double *O_r, double *PK_r, double *m_r, double *l_r,
+                                       const double *q_r, const double *Kb, const double *Vb, const __m256d inv_dk_sqrt,
+                                       const int jsize, const int dv, const int dk) {
+    // s_r is at least 1x4.
+    matmulT_kernel(s_r, q_r, Kb, 4, dk, 0, 1, 0, jsize, 0, dk);
+    __m256d s_rv = _mm256_loadu_pd(s_r);
+    s_rv = _mm256_mul_pd(s_rv, inv_dk_sqrt);
+
+    double m_rn = MAX(*m_r, reduce_max(s_rv));
+    double drate = exp(*m_r - m_rn);
+    *l_r *= drate;
+    vmul_avx2(O_r, O_r, _mm256_set1_pd(drate), dv);
+
+    // Softmax start
+    const __m256d m_rnv = _mm256_set1_pd(m_rn);
+    __m256d exp_y = exp256_pd(_mm256_sub_pd(s_rv, m_rnv));
+    _mm256_storeu_pd(p_r, exp_y);
+    // Softmax end
+
+    matmul_kernel(PK_r, p_r, Vb, 4, dv, 0, 1, 0, jsize, 0, dv);
+    vadd_avx2(O_r, O_r, PK_r, dv);
+
+    *l_r += reduce_sum(exp_y);
+    *m_r = m_rn;
+}
+
 struct attention_arg {
+    double *result;
     const double *Q, *K, *V;
-    double *result, *lresult, *Q_Kt;
     const int rank, size;
     const int m, n, dk, dv;
     const int ms, msize;
-    const int ns, nsize;
-    const int dks, dksize;
 };
-
-pthread_barrier_t barrier1, barrier2, barrier3;
 
 void *attention_worker(void *arg) {
     const struct attention_arg *args = (struct attention_arg *)arg;
 
-    double *Q_Kt = args->Q_Kt;
-    double *lresult = args->lresult + args->rank * args->m * args->dv;
-
-    // S = Q * K^T / sqrt(dk)
-    matmulT_recon_kernel(Q_Kt, args->Q, args->K, args->n, args->dk, args->ms, args->msize, 0, args->n, 0, args->dk);
+    alignas(32) double s_r[16];
+    alignas(32) double p_r[16];
+    double *O_r = calloc(4 * args->dv, sizeof(double));
+    double *PK_r = calloc(4 * args->dv, sizeof(double));
 
     const __m256d inv_dk_sqrt = _mm256_set1_pd(invsqrt(args->dk));
-    vmul_avx2(Q_Kt + args->ms * args->n, Q_Kt + args->ms * args->n, inv_dk_sqrt, args->msize * args->n);
+    const int m = args->m, n = args->n;
+    const int ms = args->ms, me = args->ms + args->msize;
+    const int msteps = ms + (args->msize / 4) * 4, mrem = args->msize % 4;
+    const int nsteps = (args->n / 4) * 4, nrem = args->n % 4;
+    // S = Q * K^T / sqrt(dk)
 
-    // S' = softmax(S)
-    double *exp_z = calloc(args->n, sizeof(double));
-    __m256d maxv = vmax_avx2(Q_Kt + args->ms * args->n, args->msize * args->n);
-    for (int i = args->ms; i < args->ms + args->msize; i++) {
-        softmax_avx2(Q_Kt + i * args->n, exp_z, maxv, args->n);
+    for (int i = ms; i < msteps; i += 4) {
+        memset(O_r, 0, 4 * args->dv * sizeof(double));
+        const double *Qb = args->Q + i * args->dk;
+        __m256d l_r = _mm256_setzero_pd();
+        __m256d m_r = _mm256_set1_pd(-HUGE_VAL);
+        int j = 0;
+        for (; j < nsteps; j += 4) {
+            const double *Kb = args->K + j * args->dk;
+            const double *Vb = args->V + j * args->dv;
+            flash_atten_4x4core(s_r, p_r, O_r, PK_r, &m_r, &l_r, Qb, Kb, Vb, inv_dk_sqrt, 4, args->dv, args->dk);
+        }
+        if (nrem) {
+            const double *Kb = args->K + j * args->dk;
+            const double *Vb = args->V + j * args->dv;
+            memset(s_r, 0, 16 * sizeof(double));
+            flash_atten_4x4core(s_r, p_r, O_r, PK_r, &m_r, &l_r, Qb, Kb, Vb, inv_dk_sqrt, nrem, args->dv, args->dk);
+        }
+        vdiv_avx2(args->result + i * args->dv, O_r, _mm256_set1_pd(l_r[0]), args->dv);
+        vdiv_avx2(args->result + (i + 1) * args->dv, O_r + args->dv, _mm256_set1_pd(l_r[1]), args->dv);
+        vdiv_avx2(args->result + (i + 2) * args->dv, O_r + 2 * args->dv, _mm256_set1_pd(l_r[2]), args->dv);
+        vdiv_avx2(args->result + (i + 3) * args->dv, O_r + 3 * args->dv, _mm256_set1_pd(l_r[3]), args->dv);
     }
-    free(exp_z);
-
-    // S' * V
-    // matmul_kernel(args->result, Q_Kt, args->V, args->n, args->dv, args->ms, args->msize, 0, args->n, 0, args->dv);
-    pthread_barrier_wait(&barrier2);
-    matmul_kernel(lresult, Q_Kt, args->V, args->n, args->dv, 0, args->m, args->ns, args->nsize, 0, args->dv);
-    pthread_barrier_wait(&barrier3);
-
-    // reduction
-    for (int r = 0; r < args->size; r++) {
-        double *rank_result = args->lresult + r * args->m * args->dv;
-        vadd_avx2(args->result + args->ms * args->dv, args->result + args->ms * args->dv,
-                  rank_result + args->ms * args->dv, args->msize * args->dv);
+    if (mrem) {
+        for (int i = msteps; i < me; i++) {
+            double l_r = 0;
+            double m_r = -HUGE_VAL;
+            const double *q_r = args->Q + i * args->dk;
+            memset(O_r, 0, args->dv * sizeof(double));
+            int j = 0;
+            for (; j < nsteps; j += 4) {
+                const double *Kb = args->K + j * args->dk;
+                const double *Vb = args->V + j * args->dv;
+                flash_atten_1x4core(s_r, p_r, O_r, PK_r, &m_r, &l_r, q_r, Kb, Vb, inv_dk_sqrt, 4, args->dv, args->dk);
+            }
+            if (nrem) {
+                const double *Kb = args->K + j * args->dk;
+                const double *Vb = args->V + j * args->dv;
+                memset(s_r, 0, 4 * sizeof(double));
+                flash_atten_1x4core(s_r, p_r, O_r, PK_r, &m_r, &l_r, q_r, Kb, Vb, inv_dk_sqrt, nrem, args->dv,
+                                    args->dk);
+            }
+            vdiv_avx2(args->result + i * args->dv, O_r, _mm256_set1_pd(l_r), args->dv);
+        }
     }
 
+    free(O_r);
+    free(PK_r);
     return NULL;
 }
 
 void attention(const double *Q, const double *K, const double *V, double *result, const int m, const int n,
                const int dk, const int dv) {
-    const int size = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    const int size = 8;
     pthread_t *threads = calloc(size - 1, sizeof(pthread_t));
     struct attention_arg *args = calloc(size - 1, sizeof(struct attention_arg));
-    pthread_barrier_init(&barrier1, NULL, size);
-    pthread_barrier_init(&barrier2, NULL, size);
-    pthread_barrier_init(&barrier3, NULL, size);
 
     memset(result, 0, m * dv * sizeof(double));
 
-    double *Q_Kt = calloc(m * n, sizeof(double));
-    double *lresult = calloc(size * m * dv, sizeof(double));
-
     const int wm = m / size, rm = m % size;
-    const int wn = n / size, rn = n % size;
-    const int wdk = dk / size, rdk = dk % size;
     int ms = 0, ns = 0, dks = 0;
 
     for (int i = 0; i < size - 1; i++) {
-        const int msize = wm + (i < rm ? 1 : 0);
-        const int nsize = wn + (i < rn ? 1 : 0);
-        const int dksize = wdk + (i < rdk ? 1 : 0);
+        const int msize = wm + (i < rm);
         struct attention_arg arg = {
             .rank = i,
             .size = size,
@@ -478,23 +649,15 @@ void attention(const double *Q, const double *K, const double *V, double *result
             .K = K,
             .V = V,
             .result = result,
-            .lresult = lresult,
-            .Q_Kt = Q_Kt,
             .m = m,
             .n = n,
             .dk = dk,
             .dv = dv,
             .ms = ms,
             .msize = msize,
-            .ns = ns,
-            .nsize = nsize,
-            .dks = dks,
-            .dksize = dksize,
         };
         memcpy(&args[i], &arg, sizeof(struct attention_arg));
         ms += msize;
-        ns += nsize;
-        dks += dksize;
         pthread_create(&threads[i], NULL, attention_worker, &args[i]);
     }
 
@@ -505,18 +668,12 @@ void attention(const double *Q, const double *K, const double *V, double *result
         .K = K,
         .V = V,
         .result = result,
-        .lresult = lresult,
-        .Q_Kt = Q_Kt,
         .m = m,
         .n = n,
         .dk = dk,
         .dv = dv,
         .ms = ms,
         .msize = wm,
-        .ns = ns,
-        .nsize = wn,
-        .dks = dks,
-        .dksize = wdk,
     };
 
     attention_worker(&arg);
@@ -524,13 +681,8 @@ void attention(const double *Q, const double *K, const double *V, double *result
     for (int i = 0; i < size - 1; i++) {
         pthread_join(threads[i], NULL);
     }
-    pthread_barrier_destroy(&barrier1);
-    pthread_barrier_destroy(&barrier2);
-    pthread_barrier_destroy(&barrier3);
     free(threads);
     free(args);
-    free(Q_Kt);
-    free(lresult);
 }
 
 // WARN: You are forbidden to modify the codes after the line in your submission.

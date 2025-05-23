@@ -186,8 +186,6 @@ static inline __m256d exp256_pd(__m256d x) {
     const __m256d exp_p4 = _mm256_set1_pd(EXP_P4);
     const __m256d exp_p5 = _mm256_set1_pd(EXP_P5);
     const __m256d exp_p6 = _mm256_set1_pd(EXP_P6);
-    const __m256d exp_p7 = _mm256_set1_pd(EXP_P7);
-    const __m256d exp_p8 = _mm256_set1_pd(EXP_P8);
 
     // 1. Range reduction: n = floor(x / ln2)
     __m256d t = _mm256_mul_pd(x, inv_ln2);
@@ -198,9 +196,7 @@ static inline __m256d exp256_pd(__m256d x) {
     r = _mm256_fnmadd_pd(n_real, ln2_lo, r);
 
     // 3. Taylor series of exp(r) to the 7th term (0 - 6)
-    __m256d poly = exp_p8;
-    poly = _mm256_fmadd_pd(poly, r, exp_p7);
-    poly = _mm256_fmadd_pd(poly, r, exp_p6);
+    __m256d poly = exp_p6;
     poly = _mm256_fmadd_pd(poly, r, exp_p5);
     poly = _mm256_fmadd_pd(poly, r, exp_p4);
     poly = _mm256_fmadd_pd(poly, r, exp_p3);
@@ -219,7 +215,15 @@ static inline __m256d exp256_pd(__m256d x) {
 
     __m256d pow2_n = _mm256_castsi256_pd(e64);
 
-    return _mm256_mul_pd(poly, pow2_n);
+    __m256d res = _mm256_mul_pd(poly, pow2_n);
+
+    for (int i = 0; i < 4; i++) {
+        if (x[i] == -INFINITY) {
+            res[i] = 0;
+        }
+    }
+
+    return res;
 }
 
 void softmax_avx2(double *z, double *exp_z, const __m256d maxv, const int n) {
@@ -440,7 +444,7 @@ static inline __attribute__((always_inline)) void flash_atten_4x4core(double *s_
     __m256d m_rdiff = _mm256_sub_pd(*m_r, m_rn);
     // Need to use acurate exp.
 
-    __m256d drate = _mm256_set_pd(exp(m_rdiff[3]), exp(m_rdiff[2]), exp(m_rdiff[1]), exp(m_rdiff[0]));
+    __m256d drate = exp256_pd(m_rdiff);
     *l_r = _mm256_mul_pd(*l_r, drate);
 
     vmul_avx2(O_r, O_r, _mm256_set1_pd(drate[0]), dv);
