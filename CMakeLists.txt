@@ -4,6 +4,7 @@ project(parallel_attention C)
 set(CMAKE_C_STANDARD 11)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 set(CMAKE_C_FLAGS "-march=native -g ${CMAKE_CXX_FLAGS}")
+# set(CMAKE_C_FLAGS "-march=native -fsanitize=address -g ${CMAKE_CXX_FLAGS}")
 
 find_package(MPI REQUIRED)
 find_package(Threads REQUIRED)

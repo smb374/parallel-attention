@@ -218,9 +218,7 @@ static inline __m256d exp256_pd(__m256d x) {
     return _mm256_mul_pd(poly, pow2_n);
 }
 
-void softmax_avx2(double *z, double *exp_z, const int n) {
-    __m256d maxv = vmax_avx2(z, n);
-
+void softmax_avx2(double *z, double *exp_z, const __m256d maxv, const int n) {
     const int nsteps = (n / 4) * 4, nrem = n % 4;
     int i = 0;
     for (; i < nsteps; i += 4) {
@@ -239,8 +237,8 @@ void softmax_avx2(double *z, double *exp_z, const int n) {
     vdiv_avx2(z, exp_z, sum, n);
 }
 
-void matmulT_kernel(double *out, const double *A, const double *B, const int n, const int p, const int ms,
-                    const int msize, const int ns, const int nsize, const int ps, const int psize) {
+void matmulT_recon_kernel(double *out, const double *A, const double *B, const int n, const int p, const int ms,
+                          const int msize, const int ns, const int nsize, const int ps, const int psize) {
     const int nsteps = ns + (nsize / 4) * 4, nrem = nsize % 4;
     const int psteps = ps + (psize / 4) * 4, prem = psize % 4;
     const int me = ms + msize, ne = ns + nsize, pe = ps + psize;
@@ -402,31 +400,6 @@ double invsqrt(double number) {
     return y;
 }
 
-double dot_product_avx2(const double *a, const double *b, const int n) {
-    double total = 0;
-    const __m256i fmask = _mm256_set1_epi8(-1);
-    __m256d sum = _mm256_setzero_pd();
-
-    for (int i = 0; i < n; i += 4) {
-        __m256i mask = (i + 4 <= n) ? fmask : create_mask(n - i);
-        __m256d x = _mm256_maskload_pd(a + i, mask);
-        __m256d y = _mm256_maskload_pd(b + i, mask);
-        sum = _mm256_fmadd_pd(x, y, sum);
-    }
-
-    return reduce_sum(sum);
-}
-
-void transpose(double *M, const int m, const int n) {
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
-            double tmp = M[i * n + j];
-            M[i * n + j] = M[j * m + i];
-            M[j * m + i] = tmp;
-        }
-    }
-}
-
 struct attention_arg {
     const double *Q, *K, *V;
     double *result, *lresult, *Q_Kt;
@@ -437,7 +410,7 @@ struct attention_arg {
     const int dks, dksize;
 };
 
-pthread_barrier_t barrier1, barrier2;
+pthread_barrier_t barrier1, barrier2, barrier3;
 
 void *attention_worker(void *arg) {
     const struct attention_arg *args = (struct attention_arg *)arg;
@@ -445,33 +418,31 @@ void *attention_worker(void *arg) {
     double *Q_Kt = args->Q_Kt;
     double *lresult = args->lresult + args->rank * args->m * args->dv;
 
-    // S = Q * K^T
-    // Q: m x dk
-    // K: n x dk
-    // K^T: dk x n
-    // S: m x n
-    matmulT_kernel(Q_Kt, args->Q, args->K, args->n, args->dk, args->ms, args->msize, 0, args->n, 0, args->dk);
+    // S = Q * K^T / sqrt(dk)
+    matmulT_recon_kernel(Q_Kt, args->Q, args->K, args->n, args->dk, args->ms, args->msize, 0, args->n, 0, args->dk);
 
-    // S' = softmax(S / sqrt(dk))
     const __m256d inv_dk_sqrt = _mm256_set1_pd(invsqrt(args->dk));
+    vmul_avx2(Q_Kt + args->ms * args->n, Q_Kt + args->ms * args->n, inv_dk_sqrt, args->msize * args->n);
+
+    // S' = softmax(S)
     double *exp_z = calloc(args->n, sizeof(double));
+    __m256d maxv = vmax_avx2(Q_Kt + args->ms * args->n, args->msize * args->n);
     for (int i = args->ms; i < args->ms + args->msize; i++) {
-        vmul_avx2(Q_Kt + i * args->n, Q_Kt + i * args->n, inv_dk_sqrt, args->n);
-        softmax_avx2(Q_Kt + i * args->n, exp_z, args->n);
+        softmax_avx2(Q_Kt + i * args->n, exp_z, maxv, args->n);
     }
     free(exp_z);
 
-    // S' * V local
-    pthread_barrier_wait(&barrier1);
-    matmul_kernel(lresult, Q_Kt, args->V, args->n, args->dv, 0, args->m, args->ns, args->nsize, 0, args->dv);
+    // S' * V
+    // matmul_kernel(args->result, Q_Kt, args->V, args->n, args->dv, args->ms, args->msize, 0, args->n, 0, args->dv);
     pthread_barrier_wait(&barrier2);
+    matmul_kernel(lresult, Q_Kt, args->V, args->n, args->dv, 0, args->m, args->ns, args->nsize, 0, args->dv);
+    pthread_barrier_wait(&barrier3);
 
     // reduction
     for (int r = 0; r < args->size; r++) {
         double *rank_result = args->lresult + r * args->m * args->dv;
-        for (int i = args->ms; i < args->ms + args->msize; i++) {
-            vadd_avx2(args->result + i * args->dv, args->result + i * args->dv, rank_result + i * args->dv, args->dv);
-        }
+        vadd_avx2(args->result + args->ms * args->dv, args->result + args->ms * args->dv,
+                  rank_result + args->ms * args->dv, args->msize * args->dv);
     }
 
     return NULL;
@@ -484,6 +455,7 @@ void attention(const double *Q, const double *K, const double *V, double *result
     struct attention_arg *args = calloc(size - 1, sizeof(struct attention_arg));
     pthread_barrier_init(&barrier1, NULL, size);
     pthread_barrier_init(&barrier2, NULL, size);
+    pthread_barrier_init(&barrier3, NULL, size);
 
     memset(result, 0, m * dv * sizeof(double));
 
@@ -554,6 +526,7 @@ void attention(const double *Q, const double *K, const double *V, double *result
     }
     pthread_barrier_destroy(&barrier1);
     pthread_barrier_destroy(&barrier2);
+    pthread_barrier_destroy(&barrier3);
     free(threads);
     free(args);
     free(Q_Kt);
